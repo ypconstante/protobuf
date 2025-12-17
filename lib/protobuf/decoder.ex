@@ -15,8 +15,7 @@ defmodule Protobuf.Decoder do
 
     bin
     |> build_message(struct(module), props)
-    |> reverse_repeated(repeated_fields)
-    |> Map.update!(:__unknown_fields__, &Enum.reverse/1)
+    |> reverse_repeated([:__unknown_fields__ | repeated_fields])
     |> transform_module(module)
   end
 
@@ -374,16 +373,20 @@ defmodule Protobuf.Decoder do
 
   defp decode_fixed64(<<>>, _type, acc), do: acc
 
-  defp reverse_repeated(message, repeated_fields) do
-    Enum.reduce(repeated_fields, message, fn repeated_field, message_acc ->
-      case message_acc do
-        %{^repeated_field => values} when is_list(values) ->
-          %{message_acc | repeated_field => Enum.reverse(values)}
+  defp reverse_repeated(message, [repeated_field | rest]) do
+    message = case message do
+      %{^repeated_field => [_ | _] = values} ->
+        %{message | repeated_field => Enum.reverse(values)}
 
-        _other ->
-          message_acc
-      end
-    end)
+      _other ->
+        message
+    end
+
+    reverse_repeated(message, rest)
+  end
+
+  defp reverse_repeated(message, []) do
+    message
   end
 
   defp field_key(%FieldProps{oneof: nil, name_atom: key}, _message_props) do
