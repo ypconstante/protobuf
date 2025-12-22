@@ -162,8 +162,9 @@ defmodule Protobuf.Wire.Varint do
 
   defp def_decoder_success_clauses(name, args, body) do
     for {pattern, expression} <- @varints do
-      quote do
-        defp unquote(name)(<<unquote(pattern), rest::bits>>, unquote_splicing(args)) do
+      quote generated: true do
+        defp unquote(name)(<<unquote(pattern), rest::bits>> = bin, unquote_splicing(args)) do
+          var!(bin) = bin
           var!(value) = unquote(expression)
           var!(rest) = rest
           unquote(body)

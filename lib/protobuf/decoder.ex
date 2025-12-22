@@ -175,6 +175,22 @@ defmodule Protobuf.Decoder do
         new_message = update_in_message(message, name_atom, value, &value_for_packed/3, prop)
         build_message(rest, new_message, props)
 
+      %{^field_number => %FieldProps{wire_type: ^wire_type, repeated?: true} = prop} when wire_type == wire_delimited() ->
+        key = field_key(prop, props)
+
+        current =
+          case message do
+            %_{^key => value} -> value
+            %_{} -> []
+          end
+
+
+        new_value = value_for_field(value, current, prop)
+        {final_value, rest} = value_for_repeated_field(rest, new_value, prop)
+
+        new_message = Map.put(message, key, final_value)
+        build_message(rest, new_message, props)
+
       %{^field_number => %FieldProps{wire_type: ^wire_type} = prop} ->
         key = field_key(prop, props)
         new_message = update_in_message(message, key, value, &value_for_field/3, prop)
@@ -372,6 +388,38 @@ defmodule Protobuf.Decoder do
   end
 
   defp decode_fixed64(<<>>, _type, acc), do: acc
+
+  defp value_for_repeated_field(<<>>, current, _prop), do: {current, ""}
+  defdecoderp value_for_repeated_field(current, %FieldProps{fnum: expected_field_number} = prop) do
+    # From the docs:
+    # "Each key in the streamed message is a varint with the value
+    # (field_number << 3) | wire_type, in other words, the last three bits of
+    # the number store the wire type."
+    field_number = bsr(value, 3)
+    wire_type = band(value, 0b00000111)
+
+    if field_number == expected_field_number and wire_type == wire_delimited() do
+        decode_repeated_delimited(rest, current, prop)
+    else
+      {current, bin}
+    end
+  end
+
+  defdecoderp decode_repeated_delimited(current, %FieldProps{fnum: field_number} = prop) do
+    bytes_remaining = byte_size(rest)
+
+    if value <= bytes_remaining do
+      <<bytes::bytes-size(value), rest::bits>> = rest
+      value = value_for_field(bytes, current, prop)
+      value_for_repeated_field(rest, value, prop)
+    else
+      msg =
+        "insufficient data decoding field_number #{field_number}, " <>
+        "expected #{inspect(rest)} to be at least #{value} bytes"
+
+      raise Protobuf.DecodeError, message: msg
+    end
+  end
 
   defp reverse_repeated(message, [repeated_field | rest]) do
     message =
