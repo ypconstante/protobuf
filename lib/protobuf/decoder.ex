@@ -7,14 +7,19 @@ defmodule Protobuf.Decoder do
   alias Protobuf.{DecodeError, FieldProps, MessageProps, Wire}
 
   @compile {:inline,
-            decode_field: 3, skip_varint: 4, skip_delimited: 4, reverse_repeated: 2, field_key: 2}
+            decode_field: 5,
+            skip_varint: 4,
+            skip_delimited: 4,
+            reverse_repeated: 2,
+            field_key: 2,
+            put_pending_value: 4}
 
   @spec decode(binary(), module()) :: term()
   def decode(bin, module) when is_binary(bin) and is_atom(module) do
     %MessageProps{repeated_fields: repeated_fields} = props = module.__message_props__()
 
     bin
-    |> build_message(struct(module), props)
+    |> build_message(struct(module), props, nil, nil)
     |> reverse_repeated([:__unknown_fields__ | repeated_fields])
     |> transform_module(module)
   end
@@ -27,13 +32,22 @@ defmodule Protobuf.Decoder do
     end
   end
 
-  defp build_message(<<>>, message, _props), do: message
-
-  defp build_message(<<bin::bits>>, message, props) do
-    decode_field(bin, message, props)
+  # To optimize performance when working with lists, handle_value calls build_message with the last field value.
+  # When the field is a list, we'll keep prepending the found values to pending_field_value until a new field starts to
+  # be decoded or the message ends, and then we'll do a single message update.
+  defp build_message(<<>>, message, props, pending_field_props, pending_field_value) do
+    if pending_field_props != nil do
+      put_pending_value(message, props, pending_field_props, pending_field_value)
+    else
+      message
+    end
   end
 
-  defdecoderp decode_field(message, props) do
+  defp build_message(<<bin::bits>>, message, props, pending_field_props, pending_field_value) do
+    decode_field(bin, message, props, pending_field_props, pending_field_value)
+  end
+
+  defdecoderp decode_field(message, props, pending_field_props, pending_field_value) do
     # From the docs:
     # "Each key in the streamed message is a varint with the value
     # (field_number << 3) | wire_type, in other words, the last three bits of
@@ -41,41 +55,71 @@ defmodule Protobuf.Decoder do
     field_number = bsr(value, 3)
     wire_type = band(value, 0b00000111)
 
+    maybe_keep_pending? = wire_type == wire_delimited()
+
+    message =
+      if pending_field_props != nil and
+           (not maybe_keep_pending? or pending_field_props.fnum != field_number) do
+        put_pending_value(message, props, pending_field_props, pending_field_value)
+      else
+        message
+      end
+
+    current_value =
+      if pending_field_props != nil and maybe_keep_pending? and
+           pending_field_props.fnum == field_number do
+        pending_field_value
+      else
+        nil
+      end
+
     if field_number != 0 do
-      handle_field(rest, field_number, wire_type, message, props)
+      handle_field(rest, field_number, wire_type, message, props, current_value)
     else
       raise Protobuf.DecodeError, message: "invalid field number 0 when decoding binary data"
     end
   end
 
-  defp handle_field(<<bin::bits>>, field_number, wire_start_group(), message, props) do
+  defp put_pending_value(message, %MessageProps{} = props, %FieldProps{} = prop, value) do
+    key = field_key(prop, props)
+    Map.put(message, key, value)
+  end
+
+  defp handle_field(
+         <<bin::bits>>,
+         field_number,
+         wire_start_group(),
+         message,
+         props,
+         _current_value
+       ) do
     skip_field(bin, message, props, [field_number])
   end
 
-  defp handle_field(<<_bin::bits>>, closing, wire_end_group(), _message, _props) do
+  defp handle_field(<<_bin::bits>>, closing, wire_end_group(), _message, _props, _current_value) do
     msg = "closing group #{inspect(closing)} but no groups are open"
     raise Protobuf.DecodeError, message: msg
   end
 
-  defp handle_field(<<bin::bits>>, field_number, wire_varint(), message, props) do
-    decode_varint(bin, field_number, message, props)
+  defp handle_field(<<bin::bits>>, field_number, wire_varint(), message, props, current_value) do
+    decode_varint(bin, field_number, message, props, current_value)
   end
 
-  defp handle_field(<<bin::bits>>, field_number, wire_delimited(), message, props) do
-    decode_delimited(bin, field_number, message, props)
+  defp handle_field(<<bin::bits>>, field_number, wire_delimited(), message, props, current_value) do
+    decode_delimited(bin, field_number, message, props, current_value)
   end
 
-  defp handle_field(<<bin::bits>>, field_number, wire_32bits(), message, props) do
+  defp handle_field(<<bin::bits>>, field_number, wire_32bits(), message, props, current_value) do
     <<value::bits-32, rest::bits>> = bin
-    handle_value(rest, field_number, wire_32bits(), value, message, props)
+    handle_value(rest, field_number, wire_32bits(), value, message, props, current_value)
   end
 
-  defp handle_field(<<bin::bits>>, field_number, wire_64bits(), message, props) do
+  defp handle_field(<<bin::bits>>, field_number, wire_64bits(), message, props, current_value) do
     <<value::bits-64, rest::bits>> = bin
-    handle_value(rest, field_number, wire_64bits(), value, message, props)
+    handle_value(rest, field_number, wire_64bits(), value, message, props, current_value)
   end
 
-  defp handle_field(_bin, _field_number, wire_type, _message, _props) do
+  defp handle_field(_bin, _field_number, wire_type, _message, _props, _current_value) do
     raise Protobuf.DecodeError,
       message: "cannot decode binary data, unknown wire type: #{inspect(wire_type)}"
   end
@@ -91,7 +135,7 @@ defmodule Protobuf.Decoder do
       wire_end_group() ->
         case groups do
           [^field_number] ->
-            build_message(rest, message, props)
+            build_message(rest, message, props, nil, nil)
 
           [^field_number | groups] ->
             skip_field(rest, message, props, groups)
@@ -144,16 +188,16 @@ defmodule Protobuf.Decoder do
     end
   end
 
-  defdecoderp decode_varint(field_number, message, props) do
-    handle_value(rest, field_number, wire_varint(), value, message, props)
+  defdecoderp decode_varint(field_number, message, props, current_value) do
+    handle_value(rest, field_number, wire_varint(), value, message, props, current_value)
   end
 
-  defdecoderp decode_delimited(field_number, message, props) do
+  defdecoderp decode_delimited(field_number, message, props, current_value) do
     bytes_remaining = byte_size(rest)
 
     if value <= bytes_remaining do
       <<bytes::bytes-size(value), rest::bits>> = rest
-      handle_value(rest, field_number, wire_delimited(), bytes, message, props)
+      handle_value(rest, field_number, wire_delimited(), bytes, message, props, current_value)
     else
       field =
         case props.field_props do
@@ -169,16 +213,16 @@ defmodule Protobuf.Decoder do
     end
   end
 
-  defp handle_value(<<rest::bits>>, field_number, wire_type, value, message, props) do
+  defp handle_value(<<rest::bits>>, field_number, wire_type, value, message, props, current_value) do
     case props.field_props do
       %{^field_number => %FieldProps{packed?: true, name_atom: name_atom} = prop} ->
-        new_message = update_in_message(message, name_atom, value, &value_for_packed/3, prop)
-        build_message(rest, new_message, props)
+        new_value = get_value(message, name_atom, value, &value_for_packed/3, prop, current_value)
+        build_message(rest, message, props, prop, new_value)
 
       %{^field_number => %FieldProps{wire_type: ^wire_type} = prop} ->
         key = field_key(prop, props)
-        new_message = update_in_message(message, key, value, &value_for_field/3, prop)
-        build_message(rest, new_message, props)
+        new_value = get_value(message, key, value, &value_for_field/3, prop, current_value)
+        build_message(rest, message, props, prop, new_value)
 
       # Repeated fields of primitive numeric types can be "packed". Their packed? flag will be
       # false, but they will be encoded as wire_delimited() one after the other. In proto2, this
@@ -186,8 +230,8 @@ defmodule Protobuf.Decoder do
       # https://developers.google.com/protocol-buffers/docs/encoding#packed
       %{^field_number => %FieldProps{repeated?: true, name_atom: name_atom} = prop}
       when wire_type == wire_delimited() ->
-        new_message = update_in_message(message, name_atom, value, &value_for_packed/3, prop)
-        build_message(rest, new_message, props)
+        new_value = get_value(message, name_atom, value, &value_for_packed/3, prop, current_value)
+        build_message(rest, message, props, prop, new_value)
 
       %{^field_number => %FieldProps{wire_type: expected, name: field}} ->
         raise DecodeError,
@@ -210,7 +254,7 @@ defmodule Protobuf.Decoder do
               %{message | __unknown_fields__: [new_field | unknown_fields]}
           end
 
-        build_message(rest, new_message, props)
+        build_message(rest, new_message, props, nil, nil)
     end
   end
 
@@ -402,13 +446,17 @@ defmodule Protobuf.Decoder do
   # Receives an update_fun and calls it with value and props params to avoid
   # the extra memory usage of creating an anonymous function with the two
   # params in its context.
-  defp update_in_message(message, key, value, update_fun, props) do
+  defp get_value(message, key, value, update_fun, props, nil) do
     current =
       case message do
         %_{^key => value} -> value
         %_{} -> nil
       end
 
-    Map.put(message, key, update_fun.(value, current, props))
+    update_fun.(value, current, props)
+  end
+
+  defp get_value(_message, _key, value, update_fun, props, current) do
+    update_fun.(value, current, props)
   end
 end
